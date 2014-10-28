@@ -91,7 +91,7 @@ struct dns_hdr {
 struct dns_qname_ftr {
 	u_int16_t	rep_type;
 	u_int16_t	rep_class;
-};
+} __attribute__ ((__packed__));
 #define DNS_REP_TYPE_A		1
 #define DNS_REP_TYPE_NS		2
 #define DNS_REP_TYPE_CNAME	5
@@ -132,7 +132,6 @@ dns_reassemble_domain (char * domain, char * buf, size_t buflen, size_t pktlen)
 	p++;
 
 	for (n = 0; n < buflen && n < pktlen; n++) {
-		printf ("n=%u, s=%u, buf=%c\n", n, s, *(p + n));
 
 		*(buf + n) = *(p + n);
 
@@ -149,6 +148,9 @@ dns_reassemble_domain (char * domain, char * buf, size_t buflen, size_t pktlen)
 		}
 		s--;
 	}
+
+	if (verbose)
+		D ("Reassemble QNAME '%s'", buf);
 
 	return n;
 }
@@ -195,13 +197,17 @@ dns_add_match (void ** root, char * query)
 
 	p = tsearch (m, root, dns_match_compare);
 	if (p == NULL) {
-		D ("failed to install dns match query %s\n", query);
+		D ("failed to install dns match query '%s'", query);
 		free (m);
 		return 0;
 	}
 
 	return 1;
 }
+
+static void
+dns_walk_action (const void *nodep, const VISIT which, const int depth);
+
 
 struct dns_match *
 dns_find_match (void ** root, struct dns_match * m)
@@ -226,11 +232,7 @@ dns_check_match (struct dns_hdr * dns, size_t pktlen, void ** root)
 
 	qn = dns->qname;
 	
-	for (n = 0; n < dns->qn_count; n++) {
-
-		if (verbose) {
-			D ("Check QNAME %s", qn);
-		}
+	for (n = 0; n < ntohs (dns->qn_count); n++) {
 
 		m.len = dns_reassemble_domain (qn, m.query,
 					       DNS_MATCH_QUELY_LEN, pktlen);
@@ -239,8 +241,8 @@ dns_check_match (struct dns_hdr * dns, size_t pktlen, void ** root)
 		if (mr) {
 			/* find ! drop ! */
 			if (verbose) {
-				D ("Match %s is find for query %s",
-				   mr->query, qn);
+				D ("Match %s is find for query '%s'",
+				   mr->query, m.query);
 			}
 			return 1;
 		}
@@ -252,6 +254,26 @@ dns_check_match (struct dns_hdr * dns, size_t pktlen, void ** root)
 	return 0;
 }
 
+static void
+dns_walk_action (const void *nodep, const VISIT which, const int depth)
+{
+	struct dns_match * m;
+
+	switch (which) {
+	case preorder:
+		break;
+	case postorder:
+		m = *(struct dns_match **) nodep;
+		printf ("%s\n", m->query);
+		break;
+	case endorder:
+		break;
+	case leaf:
+		m = *(struct dns_match **) nodep;
+		printf ("%s\n", m->query);
+		break;
+	}
+}
 
 
 /* prefix filter related codes for patricia tree */
@@ -362,6 +384,8 @@ move (struct vnfapp * va)
 	m = burst;
 
 	while (burst-- > 0) {
+
+
 		rs = &va->rx_ring->slot[j];
 		ts = &va->tx_ring->slot[k];
 
@@ -402,7 +426,7 @@ move (struct vnfapp * va)
 		}
 		
 		/* IF dns QNAME section is matched for installed tree, drop  */
-		if (dns_check_match (dns, rs->len, d4c.match_table))
+		if (dns_check_match (dns, rs->len, &d4c.match_table))
 			goto packet_drop;
 
 		   
@@ -430,9 +454,6 @@ move (struct vnfapp * va)
 
 	va->rx_ring->head = va->rx_ring->cur = j;
 	va->tx_ring->head = va->tx_ring->cur = j;
-
-	if (verbose)
-		D ("swap %d packets", m);
 
 	return m;
 }
@@ -648,7 +669,7 @@ main (int argc, char ** argv)
 			break;
 		case 'm' :
 			D ("Install match query %s", optarg);
-			ret = dns_add_match (d4c.match_table, optarg);
+			ret = dns_add_match (&d4c.match_table, optarg);
 			if (!ret) {
 				D ("failed to install match query %s", optarg);
 				return -1;
@@ -667,6 +688,12 @@ main (int argc, char ** argv)
 		}
 	}
 	
+	if (verbose) {
+		D ("d4c.match_table walk start");
+		twalk (d4c.match_table, dns_walk_action);
+		D ("d4c.match_table walk end");
+	}
+
 	if (rif == NULL || lif == NULL) {
 		usage ();
 		return -1;
