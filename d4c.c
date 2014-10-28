@@ -2,6 +2,7 @@
 /* D4C: Dirty Deeds Done Dirt Cheap */
 
 #include <stdio.h>
+#include <search.h>
 
 #define NETMAP_WITH_LIBS
 #include <net/netmap_user.h>
@@ -30,15 +31,6 @@ int vale_rings = 0;
 
 
 
-struct d4c {
-	patricia_tree_t * dst_table;
-	patricia_tree_t * src_table;
-};
-
-struct d4c d4c;
-
-
-
 struct vnfapp {
 	pthread_t tid;
 
@@ -51,15 +43,27 @@ struct vnfapp {
 };
 
 
+
+
+struct d4c {
+	void		* match_table;	/* binary tree for dns_match_match */
+	patricia_tree_t * dst_table;
+	patricia_tree_t * src_table;
+};
+
+struct d4c d4c;
+
 /* DNS related codes */
 struct dns_hdr {
 	u_int16_t	id;
 	u_int16_t	flag;
-	u_int16_t	qd_count;
+	u_int16_t	qn_count;
 	u_int16_t	an_count;
 	u_int16_t	ns_count;
 	u_int16_t	ar_count;
-};
+
+	char qname[0];
+} __attribute__ ((__packed__));
 #define DNS_FLAG_QR		0x8000
 #define DNS_FLAG_OP		0x1800
 #define DNS_FLAG_OP_STANDARD	0x0000
@@ -82,6 +86,175 @@ struct dns_hdr {
 #define DNS_IS_AUTHORITATIVE(d) (ntohs ((d)->flag) & DNS_FLAG_AA)
 
 
+/* DNS  Queries related codes */
+
+struct dns_qname_ftr {
+	u_int16_t	rep_type;
+	u_int16_t	rep_class;
+};
+#define DNS_REP_TYPE_A		1
+#define DNS_REP_TYPE_NS		2
+#define DNS_REP_TYPE_CNAME	5
+#define DNS_REP_TYPE_PTR	12
+#define DNS_REP_TYPE_MX		15
+#define DNS_REP_TYPE_AAAA	28
+#define DNS_REP_TYPE_ANY	255
+
+#define DNS_REP_CLASS_INTERNET	1
+
+
+/* DNS Filtering Query related codes */
+
+#define DNS_MATCH_QUELY_LEN	256
+
+struct dns_match {
+	char query[DNS_MATCH_QUELY_LEN];
+	int len;
+};
+
+
+
+int
+dns_reassemble_domain (char * domain, char * buf, size_t buflen, size_t pktlen)
+{
+	char * p;
+	unsigned char s, n;
+
+ 	p = domain;
+	s = domain[0];
+
+	/* check, is domain compressed ? */
+	if ((s & 0xc0) == 0xc0) {
+		return 0;
+	}
+
+	/* skip 1st number of chars */
+	p++;
+
+	for (n = 0; n < buflen && n < pktlen; n++) {
+		printf ("n=%u, s=%u, buf=%c\n", n, s, *(p + n));
+
+		*(buf + n) = *(p + n);
+
+		if (s == 0) {
+			s = *(p + n);
+
+			*(buf + n) = '.';
+			
+			if (s == 0) {
+				*(buf + n) = '\0';
+				break;
+			}
+			continue;
+		}
+		s--;
+	}
+
+	return n;
+}
+
+static int
+dns_match_compare (const void * pa, const void * pb)
+{
+	int n, len;
+	struct dns_match * ma, * mb;
+
+	ma = (struct dns_match *) pa;
+	mb = (struct dns_match *) pb;
+
+	len = (ma->len > mb->len) ? mb->len : ma->len;
+
+	for (n = 1; n <= len; n++) {
+		if (*(ma->query + (ma->len - n)) ==
+		    *(mb->query + (mb->len - n)))
+			continue;
+
+		if (*(ma->query + (ma->len - n)) >
+		    *(mb->query + (mb->len - n)))
+			return 1;
+
+		if (*(ma->query + (ma->len - n)) <
+		    *(mb->query + (mb->len - n)))
+			return -1;
+	}
+
+	return 0;
+}
+
+int
+dns_add_match (void ** root, char * query)
+{
+	void * p;
+	struct dns_match * m;
+
+	m = (struct dns_match *) malloc (sizeof (struct dns_match));
+	memset (m, 0, sizeof (struct dns_match));
+
+	strncpy (m->query, query, DNS_MATCH_QUELY_LEN);
+	m->len = strlen (query);
+
+	p = tsearch (m, root, dns_match_compare);
+	if (p == NULL) {
+		D ("failed to install dns match query %s\n", query);
+		free (m);
+		return 0;
+	}
+
+	return 1;
+}
+
+struct dns_match *
+dns_find_match (void ** root, struct dns_match * m)
+{
+	void * p;
+
+	p = tfind (m, root, dns_match_compare);
+
+	if (!p)
+		return NULL;
+
+	return *((struct dns_match **) p);
+}
+       
+
+int
+dns_check_match (struct dns_hdr * dns, size_t pktlen, void ** root)
+{
+	int n;
+	char * qn;
+	struct dns_match m, * mr;
+
+	qn = dns->qname;
+	
+	for (n = 0; n < dns->qn_count; n++) {
+
+		if (verbose) {
+			D ("Check QNAME %s", qn);
+		}
+
+		m.len = dns_reassemble_domain (qn, m.query,
+					       DNS_MATCH_QUELY_LEN, pktlen);
+		
+		mr = dns_find_match (root, &m);
+		if (mr) {
+			/* find ! drop ! */
+			if (verbose) {
+				D ("Match %s is find for query %s",
+				   mr->query, qn);
+			}
+			return 1;
+		}
+		
+		/* check next qname. add len of qname and '.'  */
+		qn = qn + m.len + 1 + sizeof (struct dns_qname_ftr);
+	}
+
+	return 0;
+}
+
+
+
+/* prefix filter related codes for patricia tree */
 
 static inline void
 dst2prefix (void * addr, u_int16_t len, prefix_t * prefix)
@@ -228,7 +401,11 @@ move (struct vnfapp * va)
 			goto packet_drop;
 		}
 		
+		/* IF dns QNAME section is matched for installed tree, drop  */
+		if (dns_check_match (dns, rs->len, d4c.match_table))
+			goto packet_drop;
 
+		   
 	packet_forward:
 
 
@@ -401,6 +578,7 @@ usage (void)
 		"\t" "-d : Prefixes of filtered destination of DNS response\n"
 		"\t" "-s : Prefixes that is NOT filtered DNS responses\n"
 		"\t" "-e : Number of Rings of a vale port\n"
+		"\t" "-m : Filter suffix of DNS Query Name\n"
 		"\t" "-f : Daemon mode\n"
 		"\t" "-v : Verbose mode\n"
 		"\t" "-h : Print this help\n"
@@ -422,9 +600,9 @@ main (int argc, char ** argv)
 	memset (&d4c, 0, sizeof (d4c));
 	d4c.dst_table = New_Patricia (32);
 	d4c.src_table = New_Patricia (32);
+	d4c.match_table = NULL;
 
-
-	while ((ch = getopt (argc, argv, "r:l:q:e:d:s:fvh")) != -1) {
+	while ((ch = getopt (argc, argv, "r:l:q:e:d:s:m:fvh")) != -1) {
 		switch (ch) {
 		case 'r' :
 			rif = optarg;
@@ -467,6 +645,14 @@ main (int argc, char ** argv)
 			
 			/* main is dummy to avoid NULL */
 			add_patricia_entry (d4c.src_table, &prefix, len, main);
+			break;
+		case 'm' :
+			D ("Install match query %s", optarg);
+			ret = dns_add_match (d4c.match_table, optarg);
+			if (!ret) {
+				D ("failed to install match query %s", optarg);
+				return -1;
+			}
 			break;
 		case 'f' :
 			f_flag = 1;
