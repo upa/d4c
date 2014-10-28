@@ -453,7 +453,7 @@ move (struct vnfapp * va)
 	}
 
 	va->rx_ring->head = va->rx_ring->cur = j;
-	va->tx_ring->head = va->tx_ring->cur = j;
+	va->tx_ring->head = va->tx_ring->cur = k;
 
 	return m;
 }
