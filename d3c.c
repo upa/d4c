@@ -1,5 +1,5 @@
 
-/* D4C: Dirty Deeds Done Dirt Cheap */
+/* D3C: DNS DGA Domain and Countermeasure */
 
 #include <stdio.h>
 #include <search.h>
@@ -45,13 +45,13 @@ struct vnfapp {
 
 
 
-struct d4c {
+struct d3c {
 	void		* match_table;	/* binary tree for dns_match_match */
 	patricia_tree_t * dst_table;
 	patricia_tree_t * src_table;
 };
 
-struct d4c d4c;
+struct d3c d3c;
 
 /* DNS related codes */
 struct dns_hdr {
@@ -406,24 +406,10 @@ move (struct vnfapp * va)
 
 		dns = (struct dns_hdr *) (udp + 1);
 
-		/* If dns packet is query and not authoritative, 
-		 * the dns packet comes from a resolver server on 
-		 * other AS !! It is DDoS packet !! Drop !!
-		 */
-
-		if (DNS_IS_RESPONSE (dns) && !DNS_IS_AUTHORITATIVE (dns) &&
-		    find_patricia_entry (d4c.dst_table, &ip->ip_dst, 32) &&
-		    !find_patricia_entry (d4c.src_table, &ip->ip_src, 32)) {
-			if (verbose) {
-				D ("drop pkt to %s", inet_ntoa (ip->ip_dst));
-			}
+		/* If it is QUERY and matched in domain black list */
+		if (DNS_IS_QUERY (dns) &&
+		    dns_check_match (dns, rs->len, &d3c.match_table))
 			goto packet_drop;
-		}
-		
-		/* IF dns QNAME section is matched for installed tree, drop  */
-		if (dns_check_match (dns, rs->len, &d4c.match_table))
-			goto packet_drop;
-
 		   
 	packet_forward:
 
@@ -587,7 +573,7 @@ nm_ring (char * ifname, int q, struct netmap_ring ** ring,  int x, int w)
 void
 usage (void)
 {
-	printf ("Usage of d4c\n"
+	printf ("Usage of d3c\n"
 		"\t" "-r : Right interface name\n"
 		"\t" "-l : Left interface name\n"
 		"\t" "-q : Max number of threads for interface\n"
@@ -613,10 +599,10 @@ main (int argc, char ** argv)
 	
 	q = 256;
 
-	memset (&d4c, 0, sizeof (d4c));
-	d4c.dst_table = New_Patricia (32);
-	d4c.src_table = New_Patricia (32);
-	d4c.match_table = NULL;
+	memset (&d3c, 0, sizeof (d3c));
+	d3c.dst_table = New_Patricia (32);
+	d3c.src_table = New_Patricia (32);
+	d3c.match_table = NULL;
 
 	while ((ch = getopt (argc, argv, "r:l:q:e:d:s:m:fvh")) != -1) {
 		switch (ch) {
@@ -649,7 +635,7 @@ main (int argc, char ** argv)
 			}
 			
 			/* main is dummy to avoid NULL */
-			add_patricia_entry (d4c.dst_table, &prefix, len, main);
+			add_patricia_entry (d3c.dst_table, &prefix, len, main);
 			break;
 		case 's' :
 			D ("Insert unfiltered source prefix %s", optarg);
@@ -660,11 +646,11 @@ main (int argc, char ** argv)
 			}
 			
 			/* main is dummy to avoid NULL */
-			add_patricia_entry (d4c.src_table, &prefix, len, main);
+			add_patricia_entry (d3c.src_table, &prefix, len, main);
 			break;
 		case 'm' :
 			D ("Install match query %s", optarg);
-			ret = dns_add_match (&d4c.match_table, optarg);
+			ret = dns_add_match (&d3c.match_table, optarg);
 			if (!ret) {
 				D ("failed to install match query %s", optarg);
 				return -1;
@@ -684,9 +670,9 @@ main (int argc, char ** argv)
 	}
 	
 	if (verbose) {
-		D ("d4c.match_table walk start");
-		twalk (d4c.match_table, dns_walk_action);
-		D ("d4c.match_table walk end");
+		D ("d3c.match_table walk start");
+		twalk (d3c.match_table, dns_walk_action);
+		D ("d3c.match_table walk end");
 	}
 
 	if (rif == NULL || lif == NULL) {
