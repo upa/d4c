@@ -323,7 +323,7 @@ int
 split_prefixlen (char * str, void * prefix, int * len)
 {
 	int n, l, c = 0;
-	char * p, * args[2];
+	char * p, * args[2] = { NULL, NULL };
 
 	/* PREIFX/LEN */
 
@@ -339,7 +339,10 @@ split_prefixlen (char * str, void * prefix, int * len)
 		}
 	}
 
-	*len = atoi (args[1]);
+	if (!args[1])
+		*len = 32;
+	else
+		*len = atoi (args[1]);
 
 	return inet_pton (AF_INET, args[0], prefix);
 }
@@ -416,7 +419,8 @@ move (struct vnfapp * va)
 		    find_patricia_entry (d4c.dst_table, &ip->ip_dst, 32) &&
 		    !find_patricia_entry (d4c.src_table, &ip->ip_src, 32)) {
 			if (verbose) {
-				D ("drop pkt to %s", inet_ntoa (ip->ip_dst));
+				D ("DDoS DNS Response from %s, Drop.",
+				   inet_ntoa (ip->ip_src));
 			}
 			goto packet_drop;
 		}
