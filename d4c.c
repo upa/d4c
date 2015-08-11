@@ -356,7 +356,6 @@ move (struct vnfapp * va)
 	struct udphdr * udp;
 	struct dns_hdr * dns;
 
-#define ZEROCOPY
 #ifdef	ZEROCOPY
 	u_int idx;
 #else
@@ -406,12 +405,14 @@ move (struct vnfapp * va)
 
 		dns = (struct dns_hdr *) (udp + 1);
 
-		/* If dns packet is query and not authoritative, 
+		/* If dns packet is response and not authoritative, 
 		 * the dns packet comes from a resolver server on 
 		 * other AS !! It is DDoS packet !! Drop !!
+		 * (but, if it is from accepted source preifx, forwarded.
 		 */
 
-		if (DNS_IS_RESPONSE (dns) && !DNS_IS_AUTHORITATIVE (dns) &&
+		if (DNS_IS_RESPONSE (dns) && 
+		    !DNS_IS_AUTHORITATIVE (dns) &&
 		    find_patricia_entry (d4c.dst_table, &ip->ip_dst, 32) &&
 		    !find_patricia_entry (d4c.src_table, &ip->ip_src, 32)) {
 			if (verbose) {
@@ -588,13 +589,18 @@ void
 usage (void)
 {
 	printf ("Usage of d4c\n"
+		"\t" " * required options.\n"
 		"\t" "-r : Right interface name\n"
 		"\t" "-l : Left interface name\n"
-		"\t" "-q : Max number of threads for interface\n"
-		"\t" "-d : Prefixes of filtered destination of DNS response\n"
-		"\t" "-s : Prefixes that is NOT filtered DNS responses\n"
-		"\t" "-e : Number of Rings of a vale port\n"
+		"\n"
+		"\t" " * DNS filtering options.\n"
+		"\t" "-d : Destination prefixes of filtered DNS responses\n"
+		"\t" "-s : Source prefixes of NOT filtered DNS responses\n"
 		"\t" "-m : Filter suffix of DNS Query Name\n"
+		"\n"
+		"\t" " * misc.\n"
+		"\t" "-q : Max number of threads for interface\n"
+		"\t" "-e : Number of Rings of a vale port\n"
 		"\t" "-f : Daemon mode\n"
 		"\t" "-v : Verbose mode\n"
 		"\t" "-h : Print this help\n"
