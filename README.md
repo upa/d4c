@@ -68,7 +68,7 @@ Example)
 All queries for `.*hogehoge.com` and `.*hugahuga.com` are dropped.
 
 
-Filter rule 1 and 2 works independently. Specifying source/destination prefixes
+Filter rule 1 and 2 work independently. Specifying source/destination prefixes
 works only for rule 1.
 
 Compile
