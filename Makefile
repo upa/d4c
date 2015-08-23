@@ -23,6 +23,12 @@ repgen: repgen.c
 install: d4c
 	$(INSTALL) -m 744 -o root -g root d4c $(INSTALLDST)/d4c
 
+install-systemd: d4c install
+	$(INSTALL) -m 644 -o root -g root \
+		systemd/etc-default-d4c /etc/default/d4c
+	$(INSTALL) -m 644 -o root -g root \
+		systemd/d4c.service /etc/systemd/system/
+
 clean:
 	if [ -f $(INSTALLDST)/d4c ]; then	\
 		rm -f $(INSTALLDST)/d4c;	\

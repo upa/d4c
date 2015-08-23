@@ -1,0 +1,4 @@
+# Envairoment values for d4c.
+#
+
+D4C_OPTS= -r eth4 -l eth5

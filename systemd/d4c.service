@@ -1,0 +1,14 @@
+[Unit]
+Description=Dirty Deeds Done Dirt Cheap
+After=network.target
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/default/d4c
+ExecStartPost=/sbin/ifconfig eth4 promisc
+ExecStartPost=/sbin/ifconfig eth5 promisc
+ExecStart=/usr/local/bin/d4c $D4C_OPTS
+KillMode=process
+
+[Install]
+WantedBy=multi-user.target
