@@ -622,6 +622,8 @@ main (int argc, char ** argv)
 	char * rif, * lif;
 	
 	q = 256;
+	rif = NULL;
+	lif = NULL;
 
 	memset (&d4c, 0, sizeof (d4c));
 	d4c.dst_table = New_Patricia (32);
@@ -700,6 +702,7 @@ main (int argc, char ** argv)
 	}
 
 	if (rif == NULL || lif == NULL) {
+		D ("left anr right interfaces must be specified.");
 		usage ();
 		return -1;
 	}
