@@ -25,6 +25,8 @@
 #define ADDR4COPY(s, d) *(((u_int32_t *)(d))) = *(((u_int32_t *)(s)))
 #define ADDRCMP(s, d) (*(((u_int32_t *)(d))) == *(((u_int32_t *)(s))))
 
+#define THREAD_MAX	64	/* max number of threads (queuenum) */
+#define MONITOR_PORT	5353	/* tcp port num for packet counter */
 
 int verbose = 0;
 int vale_rings = 0;
@@ -34,24 +36,43 @@ int vale_rings = 0;
 struct vnfapp {
 	pthread_t tid;
 
+	/* netmap related */
 	int rx_fd, tx_fd;
 	int rx_q, tx_q;
 	char * rx_if, * tx_if;
 	struct netmap_ring * rx_ring, * tx_ring;
 
+	/* packet counters */
+	u_int32_t dropped_response_pkt;
+	u_int32_t dropped_response_byte;
+	u_int32_t dropped_query_pkt;
+	u_int32_t dropped_query_byte;
+
 	void * data;
 };
 
-
-
-
 struct d4c {
-	void		* match_table;	/* binary tree for dns_match_match */
+	void		* match_table;	/* binary tree for dns_match */
 	patricia_tree_t * dst_table;
 	patricia_tree_t * src_table;
+
+	int vnfapps_num;
+	struct vnfapp * vnfapps[THREAD_MAX];
+
+	int monitor_sock;	/* tcp socket for packet counter */
+	int monitor_port;	/* port number for tcp socket */
 };
 
 struct d4c d4c;
+
+#define GATHER_COUNTERS(val, n)					\
+	do {							\
+		val = 0;					\
+		for ((n) = 0; (n) < d4c.vnfapps_num; (n)++) {	\
+			val += d4c.vnfapps[(n)]->val;		\
+		}						\
+	} while (0)						\
+
 
 /* DNS related codes */
 struct dns_hdr {
@@ -217,7 +238,7 @@ dns_find_match (void ** root, struct dns_match * m)
 
 	return *((struct dns_match **) p);
 }
-       
+
 int
 dns_check_match (struct dns_hdr * dns, size_t pktlen, void ** root)
 {
@@ -408,13 +429,13 @@ move (struct vnfapp * va)
 
 		dns = (struct dns_hdr *) (udp + 1);
 
-		/* If dns packet is response and not authoritative, 
-		 * the dns packet comes from a resolver server on 
+		/* If dns packet is response and not authoritative,
+		 * the dns packet comes from a resolver server on
 		 * other AS !! It is DDoS packet !! Drop !!
 		 * (but, if it is from accepted source preifx, forwarded.
 		 */
 
-		if (DNS_IS_RESPONSE (dns) && 
+		if (DNS_IS_RESPONSE (dns) &&
 		    !DNS_IS_AUTHORITATIVE (dns) &&
 		    find_patricia_entry (d4c.dst_table, &ip->ip_dst, 32) &&
 		    !find_patricia_entry (d4c.src_table, &ip->ip_src, 32)) {
@@ -422,14 +443,19 @@ move (struct vnfapp * va)
 				D ("DDoS DNS Response from %s, Drop.",
 				   inet_ntoa (ip->ip_src));
 			}
+			va->dropped_response_pkt++;
+			va->dropped_response_byte += rs->len;
 			goto packet_drop;
 		}
 		
 		/* IF dns QNAME section is matched for installed tree, drop  */
-		if (dns_check_match (dns, rs->len, &d4c.match_table))
+		if (dns_check_match (dns, rs->len, &d4c.match_table)) {
+			va->dropped_query_pkt++;
+			va->dropped_query_byte += rs->len;
 			goto packet_drop;
+		}
 
-		   
+
 	packet_forward:
 
 
@@ -458,7 +484,7 @@ move (struct vnfapp * va)
 	return m;
 }
 
-void * 
+void *
 processing_thread (void * param)
 {
 	struct pollfd x[1];
@@ -589,6 +615,99 @@ nm_ring (char * ifname, int q, struct netmap_ring ** ring,  int x, int w)
 #define nm_vl_rx_ring(i, q, r) nm_ring (i, q, r, 0, 0)
 
 
+/*
+ * packet counter thread.
+ */
+
+int
+tcp_server_socket (int port)
+{
+	int sock, ret, val = 1;
+	struct sockaddr_in saddr;
+
+	sock = socket (AF_INET, SOCK_STREAM, 0);
+
+	memset (&saddr, 0, sizeof (saddr));
+	saddr.sin_family = AF_INET;
+	saddr.sin_port = htons (port);
+	saddr.sin_addr.s_addr = htonl (INADDR_LOOPBACK);
+
+	ret = setsockopt (sock, SOL_SOCKET, SO_REUSEADDR, &val, sizeof (val));
+	if (ret < 0) {
+		perror ("monitor socket: failed to set SO_REUSEADDR");
+		return 0;
+	}
+
+	ret = bind (sock, (struct sockaddr *) &saddr, sizeof (saddr));
+	if (ret < 0) {
+		perror ("monitor socket: bind failed");
+		return 0;
+	}
+	
+	return sock;
+}
+
+void *
+processing_monitor_socket (void * param)
+{
+	int n, fd;
+	socklen_t len;
+	char buf[1024];
+	struct sockaddr_in saddr;
+	struct pollfd x[1];
+
+	u_int32_t dropped_response_pkt;
+	u_int32_t dropped_response_byte;
+	u_int32_t dropped_query_pkt;
+	u_int32_t dropped_query_byte;
+
+	d4c.monitor_sock = tcp_server_socket (d4c.monitor_port);
+	if (!d4c.monitor_sock) {
+		D ("faield to create monitor socket");
+		return NULL;
+	}
+	
+	x[0].fd = d4c.monitor_sock;
+	x[0].events = POLLIN | POLLERR;
+
+	D ("start to listen monitor socket");
+	listen (d4c.monitor_sock, 1);
+	
+	while (1) {
+		poll (x, 1, -1);
+
+		if (x[0].revents & POLLIN) {
+			/* accept new socket, write counters and close */
+
+			fd = accept (d4c.monitor_sock,
+				     (struct sockaddr *)&saddr, &len);
+
+			GATHER_COUNTERS (dropped_response_pkt, n);
+			GATHER_COUNTERS (dropped_response_byte, n);
+			GATHER_COUNTERS (dropped_query_pkt, n);
+			GATHER_COUNTERS (dropped_query_byte, n);
+
+			snprintf (buf, sizeof (buf),
+				  "dropped_response_pkt %u\n"
+				  "dropped_response_byte %u\n"
+				  "dropped_query_pkt %u\n"
+				  "dropped_query_byte %u\n",
+				  dropped_response_pkt,
+				  dropped_response_byte,
+				  dropped_query_pkt,
+				  dropped_query_byte);
+
+			write (fd, buf, strlen (buf) + 1);
+			close (fd);
+			x[0].revents = 0;
+		}
+	}
+
+
+	return NULL;
+}
+
+
 void
 usage (void)
 {
@@ -605,6 +724,8 @@ usage (void)
 		"\t" " * misc.\n"
 		"\t" "-q : Max number of threads for interface\n"
 		"\t" "-e : Number of Rings of a vale port\n"
+		"\t" "-p : TCP port number for packet counter (default 5353)\n"
+		"\t" "-c : enable packet counter thread (default off)\n"
 		"\t" "-f : Daemon mode\n"
 		"\t" "-v : Verbose mode\n"
 		"\t" "-h : Print this help\n"
@@ -618,7 +739,7 @@ int
 main (int argc, char ** argv)
 {
 	struct in_addr prefix;
-	int ret, q, rq, lq, n, len, ch, f_flag = 0;
+	int ret, q, rq, lq, n, len, ch, f_flag = 0, c_flag = 0;
 	char * rif, * lif;
 	
 	q = 256;
@@ -629,8 +750,10 @@ main (int argc, char ** argv)
 	d4c.dst_table = New_Patricia (32);
 	d4c.src_table = New_Patricia (32);
 	d4c.match_table = NULL;
+	d4c.vnfapps_num = 0;
+	d4c.monitor_port = MONITOR_PORT;
 
-	while ((ch = getopt (argc, argv, "r:l:q:e:d:s:m:fvh")) != -1) {
+	while ((ch = getopt (argc, argv, "r:l:q:e:d:s:m:p:cfvh")) != -1) {
 		switch (ch) {
 		case 'r' :
 			rif = optarg;
@@ -681,6 +804,14 @@ main (int argc, char ** argv)
 				D ("failed to install match query %s", optarg);
 				return -1;
 			}
+			break;
+		case 'p' :
+			d4c.monitor_port = atoi (optarg);
+			D ("port number for packet counter is %d",
+			   d4c.monitor_port);
+			break;
+		case 'c' :
+			c_flag = 1;
 			break;
 		case 'f' :
 			f_flag = 1;
@@ -738,6 +869,8 @@ main (int argc, char ** argv)
 		va->rx_fd = nm_vl_rx_ring (rif, va->rx_q, &va->rx_ring);
 		va->tx_fd = nm_vl_tx_ring (lif, va->tx_q, &va->tx_ring);
 
+		d4c.vnfapps[d4c.vnfapps_num++] = va;
+
 		pthread_create (&va->tid, NULL, processing_thread, va);
 	}
 	
@@ -754,14 +887,17 @@ main (int argc, char ** argv)
 		va->rx_fd = nm_vl_rx_ring (lif, va->rx_q, &va->rx_ring);
 		va->tx_fd = nm_vl_tx_ring (rif, va->tx_q, &va->tx_ring);
 
+		d4c.vnfapps[d4c.vnfapps_num++] = va;
+
 		pthread_create (&va->tid, NULL, processing_thread, va);
 	}
 
 
 
-	while (1) {
-		/* controlling module will be implemented here */
-		sleep (100);
+	if (c_flag) {
+		processing_monitor_socket (NULL);
+	} else {
+		while (1) sleep (100);
 	}
 
 	return 0;
