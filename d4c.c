@@ -59,6 +59,7 @@ struct d4c {
 	int vnfapps_num;
 	struct vnfapp * vnfapps[THREAD_MAX];
 
+	int accept_sock;	/* fd after accept */
 	int monitor_sock;	/* tcp socket for packet counter */
 	int monitor_port;	/* port number for tcp socket */
 };
@@ -131,6 +132,9 @@ struct dns_qname_ftr {
 struct dns_match {
 	char query[DNS_MATCH_QUELY_LEN];
 	int len;
+
+	u_int32_t dropped_pkt;
+	u_int32_t dropped_byte;
 };
 
 
@@ -215,6 +219,8 @@ dns_add_match (void ** root, char * query)
 
 	strncpy (m->query, query, DNS_MATCH_QUELY_LEN);
 	m->len = strlen (query);
+	m->dropped_pkt = 0;
+	m->dropped_byte = 0;
 
 	p = tsearch (m, root, dns_match_compare);
 	if (p == NULL) {
@@ -239,7 +245,7 @@ dns_find_match (void ** root, struct dns_match * m)
 	return *((struct dns_match **) p);
 }
 
-int
+struct dns_match *
 dns_check_match (struct dns_hdr * dns, size_t pktlen, void ** root)
 {
 	int n;
@@ -260,14 +266,14 @@ dns_check_match (struct dns_hdr * dns, size_t pktlen, void ** root)
 				D ("Match %s is find for query '%s'",
 				   mr->query, m.query);
 			}
-			return 1;
+			return mr;
 		}
 		
 		/* check next qname. add len of qname and '.'  */
 		qn = qn + m.len + 1 + sizeof (struct dns_qname_ftr);
 	}
 
-	return 0;
+	return NULL;
 }
 
 static void
@@ -287,6 +293,37 @@ dns_walk_action (const void *nodep, const VISIT which, const int depth)
 	case leaf:
 		m = *(struct dns_match **) nodep;
 		printf ("%s\n", m->query);
+		break;
+	}
+}
+
+
+static void
+dns_walk_monitor (const void *nodep, const VISIT which, const int depth)
+{
+	char buf[1024];
+	struct dns_match * m;
+
+	memset (buf, 0, sizeof (buf));
+
+	switch (which) {
+	case preorder:
+		break;
+	case postorder:
+		m = *(struct dns_match **) nodep;
+		snprintf (buf, sizeof (buf),
+			  "%s dropped_pkt %u dropped_byte %u\n",
+			  m->query, m->dropped_pkt, m->dropped_byte);
+		write (d4c.accept_sock, buf, strlen (buf) + 1);
+		break;
+	case endorder:
+		break;
+	case leaf:
+		m = *(struct dns_match **) nodep;
+		snprintf (buf, sizeof (buf),
+			  "%s dropped_pkt %u dropped_byte %u\n",
+			  m->query, m->dropped_pkt, m->dropped_byte);
+		write (d4c.accept_sock, buf, strlen (buf) + 1);
 		break;
 	}
 }
@@ -379,6 +416,7 @@ move (struct vnfapp * va)
 	struct ip * ip;
 	struct udphdr * udp;
 	struct dns_hdr * dns;
+	struct dns_match * match;
 
 #ifdef	ZEROCOPY
 	u_int idx;
@@ -449,9 +487,12 @@ move (struct vnfapp * va)
 		}
 		
 		/* IF dns QNAME section is matched for installed tree, drop  */
-		if (dns_check_match (dns, rs->len, &d4c.match_table)) {
+		match = dns_check_match (dns, rs->len, &d4c.match_table);
+		if (match) {
 			va->dropped_query_pkt++;
 			va->dropped_query_byte += rs->len;
+			match->dropped_pkt++;
+			match->dropped_byte += rs->len;
 			goto packet_drop;
 		}
 
@@ -681,6 +722,7 @@ processing_monitor_socket (void * param)
 
 			fd = accept (d4c.monitor_sock,
 				     (struct sockaddr *)&saddr, &len);
+			d4c.accept_sock = fd;
 
 			GATHER_COUNTERS (dropped_response_pkt, n);
 			GATHER_COUNTERS (dropped_response_byte, n);
@@ -698,6 +740,9 @@ processing_monitor_socket (void * param)
 				  dropped_query_byte);
 
 			write (fd, buf, strlen (buf) + 1);
+
+			twalk (d4c.match_table, dns_walk_monitor);
+
 			close (fd);
 			x[0].revents = 0;
 		}
