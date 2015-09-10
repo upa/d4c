@@ -31,6 +31,13 @@
 int verbose = 0;
 int vale_rings = 0;
 
+struct ether_vlan {
+	__u8    ether_dhost[ETH_ALEN];
+	__u8    ether_shost[ETH_ALEN];
+	__u16   vlan_tpid;
+	__u16   vlan_tci;
+	__u16   ether_type;
+} __attribute__ ((__packed__));
 
 
 struct vnfapp {
@@ -411,12 +418,14 @@ move (struct vnfapp * va)
 {
 	u_int burst, m, j, k;
 	
-	struct netmap_slot * rs, * ts;
+	u_int16_t ether_type;
 	struct ether_header * eth;
+	struct ether_vlan * veth;
 	struct ip * ip;
 	struct udphdr * udp;
 	struct dns_hdr * dns;
 	struct dns_match * match;
+	struct netmap_slot * rs, * ts;
 
 #ifdef	ZEROCOPY
 	u_int idx;
@@ -454,6 +463,21 @@ move (struct vnfapp * va)
 		eth = (struct ether_header *)
 			NETMAP_BUF (va->rx_ring, rs->buf_idx);
 		ip = (struct ip *) (eth + 1);
+
+		ether_type = eth->ether_type;
+
+		if (ether_type == htons (ETHERTYPE_VLAN)) {
+			veth = (struct ether_vlan *)
+				NETMAP_BUF (va->rx_ring, rs->buf_idx);
+			ether_type = veth->ether_type;
+			ip = (struct ip *)(veth + 1);
+		}
+
+		if (ether_type != htons (ETHERTYPE_IP)) {
+			/* XXX: IPv6 should be handled. */
+			goto packet_forward;
+		}
+
 
 		/* is DNS packet ? */
 		if (ip->ip_p != IPPROTO_UDP)
