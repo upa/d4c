@@ -478,16 +478,14 @@ move (struct vnfapp * va)
 			goto packet_forward;
 		}
 
-
 		/* is DNS packet ? */
 		if (ip->ip_p != IPPROTO_UDP)
 			goto packet_forward;
 		
 		udp = (struct udphdr *) (((char *) ip) + (ip->ip_hl * 4));
 
-		if (udp->source != htons (53))
+		if (udp->source != htons (53) && udp->dest != htons (53))
 			goto packet_forward;
-
 
 		dns = (struct dns_hdr *) (udp + 1);
 
