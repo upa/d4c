@@ -10,8 +10,8 @@ are suspected as DDoS traffic.
 	 % ./d4c 
 	 Usage of d4c
 	 	 * required options.
-	 	-r : Right interface name
-	 	-l : Left interface name
+	 	-r : Right interface name (netmap:ethX)
+	 	-l : Left interface name (netmap:ethY)
 	 
 	 	 * DNS filtering options.
 	 	-m : Filter suffix of DNS Query Name
@@ -47,7 +47,7 @@ such as Google Public DNS.
 
 Example)
 
-	 sudo ./d4c -l p2p1 -r p2p2 -d 10.10.0.0/16 -d 172.16.0.0/16 -s 8.8.8.8/32
+	 sudo ./d4c -l netmap:p2p1 -r netmap:p2p2 -d 10.10.0.0/16 -d 172.16.0.0/16 -s 8.8.8.8/32
 
 The filter is applied for the networks 10.10.0.0/16 and 172.16.0.0/16,
 and DNS response packets from Google DNS are allowed.
@@ -63,7 +63,7 @@ d4c provides a query filter function with QNAME _suffix_ match.
 
 Example)
 
-	 sudo ./d4c -l p2p1 -r p2p2 -m hogehoge.com -m hugahuga.com
+	 sudo ./d4c -l netmap:p2p1 -r netmap:p2p2 -m hogehoge.com -m hugahuga.com
 
 All queries for `.*hogehoge.com` and `.*hugahuga.com` are dropped.
 

@@ -435,7 +435,7 @@ move (struct vnfapp * va)
 #endif
 
 	j = va->rx_ring->cur;
-	k = va->rx_ring->cur;
+	k = va->tx_ring->cur;
 	burst = NM_BURST_MAX;
 
 	m = nm_ring_space (va->rx_ring);
@@ -578,105 +578,6 @@ processing_thread (void * param)
 }
 
 
-int
-nm_get_ring_num (char * ifname, int direct)
-{
-	int fd;
-	struct nmreq nmr;
-
-	fd = open ("/dev/netmap", O_RDWR);
-	if (fd < 0) {
-		D ("Unable to open /dev/netmap");
-		perror ("open");
-		return -1;
-	}
-
-	memset (&nmr, 0, sizeof (nmr));
-	nmr.nr_version = NETMAP_API;
-	strncpy (nmr.nr_name, ifname, IFNAMSIZ - 1);
-
-	if (vale_rings && strncmp (ifname, "vale", 4) == 0) {
-		nmr.nr_rx_rings = vale_rings;
-		nmr.nr_tx_rings = vale_rings;
-	}
-
-	if (ioctl (fd, NIOCGINFO, &nmr)) {
-		D ("unable to get interface info for %s", ifname);
-		return -1;
-	}
-
-	close (fd);
-
-	if (direct == 0)
-		return nmr.nr_tx_rings;
-
-	if (direct == 1)
-		return nmr.nr_rx_rings;
-
-	return -1;
-}
-#define nm_get_tx_ring_num(intf) nm_get_ring_num (intf, 0)
-#define nm_get_rx_ring_num(intf) nm_get_ring_num (intf, 1)
-
-int
-nm_ring (char * ifname, int q, struct netmap_ring ** ring,  int x, int w)
-{
-	int fd;
-	char * mem;
-	struct nmreq nmr;
-	struct netmap_if * nifp;
-
-	/* open netmap for  ring */
-
-	fd = open ("/dev/netmap", O_RDWR);
-	if (fd < 0) {
-		D ("unable to open /dev/netmap");
-		return -1;
-	}
-
-	memset (&nmr, 0, sizeof (nmr));
-	strcpy (nmr.nr_name, ifname);
-	nmr.nr_version = NETMAP_API;
-	nmr.nr_ringid = q;
-
-	if (w)
-		nmr.nr_flags |= NR_REG_ONE_NIC;
-	else
-		nmr.nr_flags |= NR_REG_ALL_NIC;
-
-	if (ioctl (fd, NIOCREGIF, &nmr) < 0) {
-		D ("unable to register interface %s", ifname);
-		return -1;
-	}
-
-	if (vale_rings && strncmp (ifname, "vale", 4) == 0) {
-		nmr.nr_rx_rings = vale_rings;
-		nmr.nr_tx_rings = vale_rings;
-	}
-
-	mem = mmap (NULL, nmr.nr_memsize,
-		    PROT_READ|PROT_WRITE, MAP_SHARED, fd, 0);
-	if (mem == MAP_FAILED) {
-		D ("unable to mmap");
-		return -1;
-	}
-
-	nifp = NETMAP_IF (mem, nmr.nr_offset);
-
-	if (x > 0)
-		*ring = NETMAP_TXRING (nifp, q);
-	else
-		*ring = NETMAP_RXRING (nifp, q);
-
-	return fd;
-}
-#define nm_hw_tx_ring(i, q, r) nm_ring (i, q, r, 1, NETMAP_HW_RING)
-#define nm_hw_rx_ring(i, q, r) nm_ring (i, q, r, 0, NETMAP_HW_RING)
-#define nm_sw_tx_ring(i, q, r) nm_ring (i, q, r, 1, NETMAP_SW_RING)
-#define nm_sw_rx_ring(i, q, r) nm_ring (i, q, r, 0, NETMAP_SW_RING)
-#define nm_vl_tx_ring(i, q, r) nm_ring (i, q, r, 1, 0)
-#define nm_vl_rx_ring(i, q, r) nm_ring (i, q, r, 0, 0)
-
 
 /*
  * packet counter thread.
@@ -780,8 +681,8 @@ usage (void)
 {
 	printf ("Usage of d4c\n"
 		"\t" " * required options.\n"
-		"\t" "-r : Right interface name\n"
-		"\t" "-l : Left interface name\n"
+		"\t" "-r : Right interface name (netmap:ethX)\n"
+		"\t" "-l : Left interface name (netmap:ethY)\n"
 		"\n"
 		"\t" " * DNS filtering options.\n"
 		"\t" "-d : Destination prefixes of filtered DNS responses\n"
@@ -805,9 +706,11 @@ usage (void)
 int
 main (int argc, char ** argv)
 {
-	struct in_addr prefix;
-	int ret, q, rq, lq, n, len, ch, f_flag = 0, c_flag = 0;
+
+	int ret, q, n, len, ch, f_flag = 0, c_flag = 0;
 	char * rif, * lif;
+	struct in_addr prefix;
+	struct nm_desc * pr = NULL, * pl = NULL;
 	
 	q = 256;
 	rif = NULL;
@@ -905,36 +808,31 @@ main (int argc, char ** argv)
 		return -1;
 	}
 	
-	rq = nm_get_rx_ring_num (rif);
-	lq = nm_get_rx_ring_num (lif);
-
-	if (rq < 0 || lq < 0) {
-		D ("failed to get number of rings");
+	pr = nm_open (rif, NULL, 0, NULL);
+	if (!pr) {
+		D ("can not open %s", rif);
 		return -1;
 	}
-	D ("Right rings is %d, Left rings is %d", rq, lq);
-	
-	if (f_flag) {
-		daemon (0, 0);
+
+	pl = nm_open (lif, NULL, 0, NULL);
+	if (!pr) {
+		D ("can not open %s", lif);
+		return -1;
 	}
-
-
-	rq = (rq < q) ? rq : q;
-	lq = (lq < q) ? lq : q;
-
-
+	
 	/* Assign threads for each RX rings of Right interface */
-	for (n = 0; n < rq; n++) {
+	for (n = pl->first_rx_ring; n <= pl->last_rx_ring; n++) {
 		struct vnfapp * va;
 		va = (struct vnfapp *) malloc (sizeof (struct vnfapp));
 		memset (va, 0, sizeof (struct vnfapp));
-
 		va->rx_q = n;
-		va->tx_q = n % lq;
+		va->tx_q = n % (pr->last_tx_ring - pr->first_tx_ring + 1);
 		va->rx_if = rif;
 		va->tx_if = lif;
-		va->rx_fd = nm_vl_rx_ring (rif, va->rx_q, &va->rx_ring);
-		va->tx_fd = nm_vl_tx_ring (lif, va->tx_q, &va->tx_ring);
+		va->rx_fd = pl->fd;
+		va->tx_fd = pr->fd;
+		va->rx_ring = NETMAP_RXRING (pl->nifp, va->rx_q);
+		va->tx_ring = NETMAP_TXRING (pr->nifp, va->tx_q);
 
 		d4c.vnfapps[d4c.vnfapps_num++] = va;
 
@@ -942,24 +840,27 @@ main (int argc, char ** argv)
 	}
 	
 	/* Assign threads for each RX rings of Left interfaces  */
-	for (n = 0; n < lq; n++) {
+	for (n = pr->first_rx_ring; n <= pr->last_rx_ring; n++) {
 		struct vnfapp * va;
 		va = (struct vnfapp *) malloc (sizeof (struct vnfapp));
 		memset (va, 0, sizeof (struct vnfapp));
-
 		va->rx_q = n;
-		va->tx_q = n % rq;
+		va->tx_q = n % (pl->last_tx_ring - pl->first_tx_ring + 1);
 		va->rx_if = lif;
 		va->tx_if = rif;
-		va->rx_fd = nm_vl_rx_ring (lif, va->rx_q, &va->rx_ring);
-		va->tx_fd = nm_vl_tx_ring (rif, va->tx_q, &va->tx_ring);
+		va->rx_fd = pr->fd;
+		va->tx_fd = pl->fd;
+		va->rx_ring = NETMAP_RXRING (pr->nifp, va->rx_q);
+		va->tx_ring = NETMAP_TXRING (pl->nifp, va->tx_q);
 
 		d4c.vnfapps[d4c.vnfapps_num++] = va;
 
 		pthread_create (&va->tid, NULL, processing_thread, va);
 	}
 
-
+        if (f_flag) {
+                daemon (0, 0);
+        }
 
 	if (c_flag) {
 		processing_monitor_socket (NULL);
