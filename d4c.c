@@ -18,7 +18,7 @@
 
 
 #include "patricia.h"
-
+#include "ssap_trie.h"
 
 #define NM_BURST_MAX	1024
 
@@ -59,7 +59,7 @@ struct vnfapp {
 };
 
 struct d4c {
-	void		* match_table;	/* binary tree for dns_match */
+	struct ssap_trie	* match_table;	/* ptree for dns_match */
 	patricia_tree_t * dst_table;
 	patricia_tree_t * src_table;
 
@@ -187,38 +187,10 @@ dns_reassemble_domain (char * domain, char * buf, size_t buflen, size_t pktlen)
 	return n;
 }
 
-static int
-dns_match_compare (const void * pa, const void * pb)
-{
-	int n, len;
-	struct dns_match * ma, * mb;
-
-	ma = (struct dns_match *) pa;
-	mb = (struct dns_match *) pb;
-
-	len = (ma->len > mb->len) ? mb->len : ma->len;
-
-	for (n = 1; n <= len; n++) {
-		if (*(ma->query + (ma->len - n)) ==
-		    *(mb->query + (mb->len - n)))
-			continue;
-
-		if (*(ma->query + (ma->len - n)) >
-		    *(mb->query + (mb->len - n)))
-			return 1;
-
-		if (*(ma->query + (ma->len - n)) <
-		    *(mb->query + (mb->len - n)))
-			return -1;
-	}
-
-	return 0;
-}
 
 int
-dns_add_match (void ** root, char * query)
+dns_add_match (struct ssap_trie * root, char * query)
 {
-	void * p;
 	struct dns_match * m;
 
 	m = (struct dns_match *) malloc (sizeof (struct dns_match));
@@ -229,31 +201,26 @@ dns_add_match (void ** root, char * query)
 	m->dropped_pkt = 0;
 	m->dropped_byte = 0;
 
-	p = tsearch (m, root, dns_match_compare);
-	if (p == NULL) {
-		D ("failed to install dns match query '%s'", query);
-		free (m);
-		return 0;
-	}
+	ssap_trie_add (root, query, m);
 
 	return 1;
 }
 
 struct dns_match *
-dns_find_match (void ** root, struct dns_match * m)
+dns_find_match (struct ssap_trie * root, struct dns_match * m)
 {
-	void * p;
+	struct ssap_trie * trie;
 
-	p = tfind (m, root, dns_match_compare);
+	trie = ssap_trie_search (root, m->query);
 
-	if (!p)
+	if (!trie)
 		return NULL;
 
-	return *((struct dns_match **) p);
+	return (struct dns_match *) trie->data;
 }
 
 struct dns_match *
-dns_check_match (struct dns_hdr * dns, size_t pktlen, void ** root)
+dns_check_match (struct dns_hdr * dns, size_t pktlen, struct ssap_trie * root)
 {
 	int n;
 	char * qn;
@@ -265,15 +232,15 @@ dns_check_match (struct dns_hdr * dns, size_t pktlen, void ** root)
 
 		m.len = dns_reassemble_domain (qn, m.query,
 					       DNS_MATCH_QUELY_LEN, pktlen);
-		
+
 		mr = dns_find_match (root, &m);
 		if (mr) {
-			/* find ! drop ! */
-			if (verbose) {
-				D ("Match %s is find for query '%s'",
-				   mr->query, m.query);
-			}
-			return mr;
+                        /* find ! drop ! */
+                        if (verbose) {
+                                D ("Match %s is find for query '%s'",
+                                   mr->query, m.query);
+                        }
+                        return mr;
 		}
 		
 		/* check next qname. add len of qname and '.'  */
@@ -284,55 +251,28 @@ dns_check_match (struct dns_hdr * dns, size_t pktlen, void ** root)
 }
 
 static void
-dns_walk_action (const void *nodep, const VISIT which, const int depth)
+dns_walk_action (void * data)
 {
 	struct dns_match * m;
 
-	switch (which) {
-	case preorder:
-		break;
-	case postorder:
-		m = *(struct dns_match **) nodep;
-		printf ("%s\n", m->query);
-		break;
-	case endorder:
-		break;
-	case leaf:
-		m = *(struct dns_match **) nodep;
-		printf ("%s\n", m->query);
-		break;
-	}
+	m = (struct dns_match *) data;
+	printf ("%s\n", m->query);
 }
 
 
 static void
-dns_walk_monitor (const void *nodep, const VISIT which, const int depth)
+dns_walk_monitor (void * data)
 {
 	char buf[1024];
-	struct dns_match * m;
+	struct dns_match * m = (struct dns_match *) data;
 
 	memset (buf, 0, sizeof (buf));
 
-	switch (which) {
-	case preorder:
-		break;
-	case postorder:
-		m = *(struct dns_match **) nodep;
-		snprintf (buf, sizeof (buf),
-			  "%s dropped_pkt %u dropped_byte %u\n",
-			  m->query, m->dropped_pkt, m->dropped_byte);
-		write (d4c.accept_sock, buf, strlen (buf) + 1);
-		break;
-	case endorder:
-		break;
-	case leaf:
-		m = *(struct dns_match **) nodep;
-		snprintf (buf, sizeof (buf),
-			  "%s dropped_pkt %u dropped_byte %u\n",
-			  m->query, m->dropped_pkt, m->dropped_byte);
-		write (d4c.accept_sock, buf, strlen (buf) + 1);
-		break;
-	}
+	snprintf (buf, sizeof (buf),
+		  "%s dropped_pkt %u dropped_byte %u\n",
+		  m->query, m->dropped_pkt, m->dropped_byte);
+
+	write (d4c.accept_sock, buf, strlen (buf) + 1);
 }
 
 
@@ -509,7 +449,7 @@ move (struct vnfapp * va)
 		}
 		
 		/* IF dns QNAME section is matched for installed tree, drop  */
-		match = dns_check_match (dns, rs->len, &d4c.match_table);
+		match = dns_check_match (dns, rs->len, d4c.match_table);
 		if (match) {
 			va->dropped_query_pkt++;
 			va->dropped_query_byte += rs->len;
@@ -664,7 +604,7 @@ processing_monitor_socket (void * param)
 
 			write (fd, buf, strlen (buf) + 1);
 
-			twalk (d4c.match_table, dns_walk_monitor);
+			ssap_trie_walk (d4c.match_table, dns_walk_monitor);
 
 			close (fd);
 			x[0].revents = 0;
@@ -719,7 +659,7 @@ main (int argc, char ** argv)
 	memset (&d4c, 0, sizeof (d4c));
 	d4c.dst_table = New_Patricia (32);
 	d4c.src_table = New_Patricia (32);
-	d4c.match_table = NULL;
+	d4c.match_table = ssap_trie_new ('X');
 	d4c.vnfapps_num = 0;
 	d4c.monitor_port = MONITOR_PORT;
 
@@ -769,7 +709,7 @@ main (int argc, char ** argv)
 			break;
 		case 'm' :
 			D ("Install match query %s", optarg);
-			ret = dns_add_match (&d4c.match_table, optarg);
+			ret = dns_add_match (d4c.match_table, optarg);
 			if (!ret) {
 				D ("failed to install match query %s", optarg);
 				return -1;
@@ -798,7 +738,7 @@ main (int argc, char ** argv)
 	
 	if (verbose) {
 		D ("d4c.match_table walk start");
-		twalk (d4c.match_table, dns_walk_action);
+		ssap_trie_walk (d4c.match_table, dns_walk_action);
 		D ("d4c.match_table walk end");
 	}
 
