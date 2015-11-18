@@ -567,11 +567,11 @@ processing_thread (void * param)
 
 		poll (x, 1, -1);
 
-		ioctl (va->rx_fd, NIOCRXSYNC, va->rx_q);
-
-		move (va);
-
-		ioctl (va->tx_fd, NIOCTXSYNC, va->rx_q);
+		if (!nm_ring_empty (va->rx_ring)) {
+			ioctl (va->rx_fd, NIOCRXSYNC, va->rx_q);
+			move (va);
+			ioctl (va->tx_fd, NIOCTXSYNC, va->rx_q);
+		}
 	}
 
 	return NULL;
