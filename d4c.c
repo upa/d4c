@@ -49,6 +49,8 @@ struct vnfapp {
 	char * rx_if, * tx_if;
 	struct netmap_ring * rx_ring, * tx_ring;
 
+	struct nm_desc * src, * dst;	/* used for only single mode */
+
 	/* packet counters */
 	u_int32_t dropped_response_pkt;
 	u_int32_t dropped_response_byte;
@@ -163,13 +165,16 @@ dns_reassemble_domain (char * domain, char * buf, size_t buflen, size_t pktlen)
 	/* skip 1st number of chars */
 	p++;
 
-	for (n = 0; n < buflen && n < pktlen; n++) {
+	for (n = 0; n < buflen && n < 255; n++) {
 
 		*(buf + n) = *(p + n);
 
 		if (s == 0) {
 			s = *(p + n);
-
+			if ((s & 0xc0) == 0xc0) {
+				/* compressed. break... */
+				return 0;
+			}
 			*(buf + n) = '.';
 			
 			if (s == 0) {
@@ -179,6 +184,11 @@ dns_reassemble_domain (char * domain, char * buf, size_t buflen, size_t pktlen)
 			continue;
 		}
 		s--;
+	}
+
+	if (n > 254) {
+		D ("domain name length is over 255");
+		return 0;
 	}
 
 	if (verbose)
@@ -222,29 +232,24 @@ dns_find_match (struct ssap_trie * root, struct dns_match * m)
 struct dns_match *
 dns_check_match (struct dns_hdr * dns, size_t pktlen, struct ssap_trie * root)
 {
-	int n;
 	char * qn;
 	struct dns_match m, * mr;
 
+	/* check only one qname */
+
 	qn = dns->qname;
 	
-	for (n = 0; n < ntohs (dns->qn_count); n++) {
+	m.len = dns_reassemble_domain (qn, m.query,
+				       DNS_MATCH_QUELY_LEN, pktlen);
 
-		m.len = dns_reassemble_domain (qn, m.query,
-					       DNS_MATCH_QUELY_LEN, pktlen);
-
-		mr = dns_find_match (root, &m);
-		if (mr) {
-                        /* find ! drop ! */
-                        if (verbose) {
-                                D ("Match %s is find for query '%s'",
-                                   mr->query, m.query);
-                        }
-                        return mr;
+	mr = dns_find_match (root, &m);
+	if (mr) {
+		/* find ! drop ! */
+		if (verbose) {
+			D ("Match %s is find for query '%s'",
+			   mr->query, m.query);
 		}
-		
-		/* check next qname. add len of qname and '.'  */
-		qn = qn + m.len + 1 + sizeof (struct dns_qname_ftr);
+		return mr;
 	}
 
 	return NULL;
@@ -354,7 +359,7 @@ split_prefixlen (char * str, void * prefix, int * len)
 
 
 u_int
-move (struct vnfapp * va)
+move (struct vnfapp * va, struct netmap_ring * rx_ring, struct netmap_ring * tx_ring)
 {
 	u_int burst, m, j, k;
 	
@@ -374,15 +379,15 @@ move (struct vnfapp * va)
 	char * dpkt;
 #endif
 
-	j = va->rx_ring->cur;
-	k = va->tx_ring->cur;
+	j = rx_ring->cur;
+	k = tx_ring->cur;
 	burst = NM_BURST_MAX;
 
-	m = nm_ring_space (va->rx_ring);
+	m = nm_ring_space (rx_ring);
 	if (m < burst)
 		burst = m;
 
-	m = nm_ring_space (va->tx_ring);
+	m = nm_ring_space (tx_ring);
 	if (m < burst)
 		burst = m;
 
@@ -390,9 +395,8 @@ move (struct vnfapp * va)
 
 	while (burst-- > 0) {
 
-
-		rs = &va->rx_ring->slot[j];
-		ts = &va->tx_ring->slot[k];
+		rs = &rx_ring->slot[j];
+		ts = &tx_ring->slot[k];
 
 		if (ts->buf_idx < 2 || rs->buf_idx < 2) {
 			D ("wrong index rx[%d] = %d -> tx[%d] = %d",
@@ -401,14 +405,14 @@ move (struct vnfapp * va)
 		}
 
 		eth = (struct ether_header *)
-			NETMAP_BUF (va->rx_ring, rs->buf_idx);
+			NETMAP_BUF (rx_ring, rs->buf_idx);
 		ip = (struct ip *) (eth + 1);
 
 		ether_type = eth->ether_type;
 
 		if (ether_type == htons (ETHERTYPE_VLAN)) {
 			veth = (struct ether_vlan *)
-				NETMAP_BUF (va->rx_ring, rs->buf_idx);
+				NETMAP_BUF (rx_ring, rs->buf_idx);
 			ether_type = veth->ether_type;
 			ip = (struct ip *)(veth + 1);
 		}
@@ -450,6 +454,7 @@ move (struct vnfapp * va)
 		
 		/* IF dns QNAME section is matched for installed tree, drop  */
 		match = dns_check_match (dns, rs->len, d4c.match_table);
+		//match = NULL;
 		if (match) {
 			va->dropped_query_pkt++;
 			va->dropped_query_byte += rs->len;
@@ -457,7 +462,6 @@ move (struct vnfapp * va)
 			match->dropped_byte += rs->len;
 			goto packet_drop;
 		}
-
 
 	packet_forward:
 
@@ -470,21 +474,27 @@ move (struct vnfapp * va)
 		rs->flags |= NS_BUF_CHANGED;
 		ts->len = rs->len;
 #else
-		spkt = NETMAP_BUF (va->rx_ring, rs->buf_idx);
-		dpkt = NETMAP_BUF (va->tx_ring, ts->buf_idx);
+		spkt = NETMAP_BUF (rx_ring, rs->buf_idx);
+		dpkt = NETMAP_BUF (tx_ring, ts->buf_idx);
 		nm_pkt_copy (spkt, dpkt, rs->len);
 		ts->len = rs->len;
 #endif
 		
 	packet_drop:
-		j = nm_ring_next (va->rx_ring, j);
-		k = nm_ring_next (va->tx_ring, k);
+		j = nm_ring_next (rx_ring, j);
+		k = nm_ring_next (tx_ring, k);
 	}
 
-	va->rx_ring->head = va->rx_ring->cur = j;
-	va->tx_ring->head = va->tx_ring->cur = k;
+	rx_ring->head = rx_ring->cur = j;
+	tx_ring->head = tx_ring->cur = k;
 
 	return m;
+}
+
+u_int
+move2 (struct vnfapp * va)
+{
+	return move (va, va->rx_ring, va->tx_ring);
 }
 
 void *
@@ -509,14 +519,53 @@ processing_thread (void * param)
 
 		if (!nm_ring_empty (va->rx_ring)) {
 			ioctl (va->rx_fd, NIOCRXSYNC, va->rx_q);
-			move (va);
-			ioctl (va->tx_fd, NIOCTXSYNC, va->rx_q);
+			move2 (va);
+			ioctl (va->tx_fd, NIOCTXSYNC, va->tx_q);
 		}
 	}
 
 	return NULL;
 }
 
+void *
+processing_single_thread (void * param)
+{
+	struct vnfapp * va = (struct vnfapp *) param;
+	struct nm_desc * src = va->src;
+	struct nm_desc * dst = va->dst;
+	struct pollfd x[1];
+        struct netmap_ring *txring, *rxring;
+	u_int si, di;
+
+	pthread_detach (pthread_self ());
+
+	x[0].fd = src->fd;
+	x[0].events = POLLIN;
+
+	while (1) {
+
+		poll (x, 1, -1);
+
+		si = src->first_rx_ring;
+		di = dst->first_tx_ring;
+
+		while (si <= src->last_rx_ring && di <= dst->last_tx_ring) {
+			rxring = NETMAP_RXRING(src->nifp, si);
+			txring = NETMAP_TXRING(dst->nifp, di);
+			if (nm_ring_empty(rxring)) {
+				si++;
+				continue;
+			}
+			if (nm_ring_empty(txring)) {
+				di++;
+				continue;
+			}
+			move (va, rxring, txring);
+		}
+	}
+
+	return NULL;
+}
 
 
 /*
@@ -637,6 +686,7 @@ usage (void)
 		"\t" "-f : Daemon mode\n"
 		"\t" "-v : Verbose mode\n"
 		"\t" "-h : Print this help\n"
+		"\t" "-o : single thread mode\n"
 		"");
 		
 
@@ -647,7 +697,7 @@ int
 main (int argc, char ** argv)
 {
 
-	int ret, q, n, len, ch, f_flag = 0, c_flag = 0;
+	int ret, q, n, len, ch, f_flag = 0, c_flag = 0, o_flag = 0;
 	char * rif, * lif;
 	struct in_addr prefix;
 	struct nm_desc * pr = NULL, * pl = NULL;
@@ -663,7 +713,7 @@ main (int argc, char ** argv)
 	d4c.vnfapps_num = 0;
 	d4c.monitor_port = MONITOR_PORT;
 
-	while ((ch = getopt (argc, argv, "r:l:q:e:d:s:m:p:cfvh")) != -1) {
+	while ((ch = getopt (argc, argv, "r:l:q:e:d:s:m:p:cfvho")) != -1) {
 		switch (ch) {
 		case 'r' :
 			rif = optarg;
@@ -729,6 +779,9 @@ main (int argc, char ** argv)
 		case 'v' :
 			verbose = 1;
 			break;
+		case 'o' :
+			o_flag = 1;
+			break;
 		case 'h' :
 		default :
 			usage ();
@@ -760,42 +813,62 @@ main (int argc, char ** argv)
 		return -1;
 	}
 	
-	/* Assign threads for each RX rings of Right interface */
-	for (n = pl->first_rx_ring; n <= pl->last_rx_ring; n++) {
-		struct vnfapp * va;
-		va = (struct vnfapp *) malloc (sizeof (struct vnfapp));
-		memset (va, 0, sizeof (struct vnfapp));
-		va->rx_q = n;
-		va->tx_q = n % (pr->last_tx_ring - pr->first_tx_ring + 1);
-		va->rx_if = rif;
-		va->tx_if = lif;
-		va->rx_fd = pl->fd;
-		va->tx_fd = pr->fd;
-		va->rx_ring = NETMAP_RXRING (pl->nifp, va->rx_q);
-		va->tx_ring = NETMAP_TXRING (pr->nifp, va->tx_q);
+	if (o_flag) {
+		/* single thread mode */
+		struct vnfapp * va_r_l;
+		va_r_l = (struct vnfapp *) malloc (sizeof (struct vnfapp));
+		memset (va_r_l, 0, sizeof (struct vnfapp));
+		va_r_l->src = pr;
+		va_r_l->dst = pl;
+		d4c.vnfapps[d4c.vnfapps_num++] = va_r_l;
+		pthread_create (&va_r_l->tid, NULL, processing_single_thread, va_r_l);
 
-		d4c.vnfapps[d4c.vnfapps_num++] = va;
+		struct vnfapp * va_l_r;
+		va_l_r = (struct vnfapp *) malloc (sizeof (struct vnfapp));
+		memset (va_l_r, 0, sizeof (struct vnfapp));
+		va_l_r->src = pl;
+		va_l_r->dst = pr;
+		d4c.vnfapps[d4c.vnfapps_num++] = va_l_r;
+		pthread_create (&va_l_r->tid, NULL, processing_single_thread, va_l_r);
+	} else {
 
-		pthread_create (&va->tid, NULL, processing_thread, va);
-	}
+		/* Assign threads for each RX rings of Right interface */
+		for (n = pl->first_rx_ring; n <= pl->last_rx_ring; n++) {
+			struct vnfapp * va;
+			va = (struct vnfapp *) malloc (sizeof (struct vnfapp));
+			memset (va, 0, sizeof (struct vnfapp));
+			va->rx_q = n;
+			va->tx_q = n % (pr->last_tx_ring - pr->first_tx_ring + 1);
+			va->rx_if = rif;
+			va->tx_if = lif;
+			va->rx_fd = pl->fd;
+			va->tx_fd = pr->fd;
+			va->rx_ring = NETMAP_RXRING (pl->nifp, va->rx_q);
+			va->tx_ring = NETMAP_TXRING (pr->nifp, va->tx_q);
+
+			d4c.vnfapps[d4c.vnfapps_num++] = va;
+
+			pthread_create (&va->tid, NULL, processing_thread, va);
+		}
 	
-	/* Assign threads for each RX rings of Left interfaces  */
-	for (n = pr->first_rx_ring; n <= pr->last_rx_ring; n++) {
-		struct vnfapp * va;
-		va = (struct vnfapp *) malloc (sizeof (struct vnfapp));
-		memset (va, 0, sizeof (struct vnfapp));
-		va->rx_q = n;
-		va->tx_q = n % (pl->last_tx_ring - pl->first_tx_ring + 1);
-		va->rx_if = lif;
-		va->tx_if = rif;
-		va->rx_fd = pr->fd;
-		va->tx_fd = pl->fd;
-		va->rx_ring = NETMAP_RXRING (pr->nifp, va->rx_q);
-		va->tx_ring = NETMAP_TXRING (pl->nifp, va->tx_q);
+		/* Assign threads for each RX rings of Left interfaces  */
+		for (n = pr->first_rx_ring; n <= pr->last_rx_ring; n++) {
+			struct vnfapp * va;
+			va = (struct vnfapp *) malloc (sizeof (struct vnfapp));
+			memset (va, 0, sizeof (struct vnfapp));
+			va->rx_q = n;
+			va->tx_q = n % (pl->last_tx_ring - pl->first_tx_ring + 1);
+			va->rx_if = lif;
+			va->tx_if = rif;
+			va->rx_fd = pr->fd;
+			va->tx_fd = pl->fd;
+			va->rx_ring = NETMAP_RXRING (pr->nifp, va->rx_q);
+			va->tx_ring = NETMAP_TXRING (pl->nifp, va->tx_q);
 
-		d4c.vnfapps[d4c.vnfapps_num++] = va;
+			d4c.vnfapps[d4c.vnfapps_num++] = va;
 
-		pthread_create (&va->tid, NULL, processing_thread, va);
+			pthread_create (&va->tid, NULL, processing_thread, va);
+		}
 	}
 
         if (f_flag) {
