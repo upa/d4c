@@ -195,7 +195,8 @@ xmit (struct vnfapp * va)
 	struct dns_qname_ftr * ftr;
 
 	__u8 smac[ETH_ALEN] = { 0x01, 0x01, 0x01, 0x02, 0x02, 0x02 };
-	__u8 dmac[ETH_ALEN] = { 0x01, 0x01, 0x01, 0x03, 0x03, 0x03 };
+	//__u8 dmac[ETH_ALEN] = { 0x01, 0x01, 0x01, 0x03, 0x03, 0x03 };
+	__u8 dmac[ETH_ALEN] = { 0xa0, 0x36, 0x9f, 0x2b, 0x27, 0xd0 };
 	struct in_addr saddr = { 0x0100000A };
 	struct in_addr daddr = { 0x0200000A };	
 
@@ -209,11 +210,12 @@ xmit (struct vnfapp * va)
 	m = burst;
 
 
+#define QNAME_LEN 29
 	len = 	sizeof (struct ether_header) + 
 		sizeof (struct ip) + 
 		sizeof (struct udphdr) +
 		sizeof (struct dns_hdr) +
-		14 + sizeof (struct dns_qname_ftr);
+		QNAME_LEN + sizeof (struct dns_qname_ftr);
 
 
 	while (burst-- > 0) {
@@ -237,10 +239,42 @@ xmit (struct vnfapp * va)
 
 		dns->id = 0x0002;
 		dns->flag = htons (0x0100);
-		dns->qn_count = htons (1);
+		dns->qn_count = htons (2);
 		dns->an_count = 0;
 		dns->ns_count = 0;
 		dns->ar_count = 0;
+
+		dns->qname[0] = 0x03;
+		dns->qname[1] = 'a';
+		dns->qname[2] = 'a';
+		dns->qname[3] = 'a';
+		dns->qname[4] = 0x03;
+		dns->qname[5] = 'b';
+		dns->qname[6] = 'b';
+		dns->qname[7] = 'b';
+		dns->qname[8] = 0x03;
+		dns->qname[9] = 'c';
+		dns->qname[10] = 'c';
+		dns->qname[11] = 'c';
+		dns->qname[12] = 0x03;
+		dns->qname[13] = 'd';
+		dns->qname[14] = 'd';
+		dns->qname[15] = 'd';
+		dns->qname[16] = 0x03;
+		dns->qname[17] = 'e';
+		dns->qname[18] = 'e';
+		dns->qname[19] = 'e';
+		dns->qname[20] = 0x03;
+		dns->qname[21] = 'f';
+		dns->qname[22] = 'f';
+		dns->qname[23] = 'f';
+		dns->qname[24] = 0x03;
+		dns->qname[25] = 'g';
+		dns->qname[26] = 'g';
+		dns->qname[27] = 'g';
+		dns->qname[28] = 0x00;
+
+		/*
 		dns->qname[0] = 0x03;
 		dns->qname[1] = 'w';
 		dns->qname[2] = 'w';
@@ -255,13 +289,13 @@ xmit (struct vnfapp * va)
 		dns->qname[11] = 'e';
 		dns->qname[12] = 't';
 		dns->qname[13] = 0x00;
+		*/
 
-		ftr = (struct dns_qname_ftr *)(&dns->qname[14]);
+		ftr = (struct dns_qname_ftr *)(&dns->qname[QNAME_LEN]);
 		ftr->rep_type  = htons (DNS_REP_TYPE_A);
 		ftr->rep_class = htons (DNS_REP_CLASS_INTERNET);
 
 		ts->len = len;
-
 		k = nm_ring_next (va->tx_ring, k);
 
 	}
@@ -286,112 +320,13 @@ processing_thread (void * param)
 	while (1) {
 
 		xmit (va);
-
-		ioctl (va->tx_fd, NIOCTXSYNC, va->rx_q);
+		if (va->tx_q == 0) {
+			ioctl (va->tx_fd, NIOCTXSYNC, va->rx_q);
+		}
 	}
 
 	return NULL;
 }
-
-
-int
-nm_get_ring_num (char * ifname, int direct)
-{
-	int fd;
-	struct nmreq nmr;
-
-	fd = open ("/dev/netmap", O_RDWR);
-	if (fd < 0) {
-		D ("Unable to open /dev/netmap");
-		perror ("open");
-		return -1;
-	}
-
-	memset (&nmr, 0, sizeof (nmr));
-	nmr.nr_version = NETMAP_API;
-	strncpy (nmr.nr_name, ifname, IFNAMSIZ - 1);
-
-	if (vale_rings && strncmp (ifname, "vale", 4) == 0) {
-		nmr.nr_rx_rings = vale_rings;
-		nmr.nr_tx_rings = vale_rings;
-	}
-
-	if (ioctl (fd, NIOCGINFO, &nmr)) {
-		D ("unable to get interface info for %s", ifname);
-		return -1;
-	}
-
-	close (fd);
-
-	if (direct == 0)
-		return nmr.nr_tx_rings;
-
-	if (direct == 1)
-		return nmr.nr_rx_rings;
-
-	return -1;
-}
-#define nm_get_tx_ring_num(intf) nm_get_ring_num (intf, 0)
-#define nm_get_rx_ring_num(intf) nm_get_ring_num (intf, 1)
-
-int
-nm_ring (char * ifname, int q, struct netmap_ring ** ring,  int x, int w)
-{
-	int fd;
-	char * mem;
-	struct nmreq nmr;
-	struct netmap_if * nifp;
-
-	/* open netmap for  ring */
-
-	fd = open ("/dev/netmap", O_RDWR);
-	if (fd < 0) {
-		D ("unable to open /dev/netmap");
-		return -1;
-	}
-
-	memset (&nmr, 0, sizeof (nmr));
-	strcpy (nmr.nr_name, ifname);
-	nmr.nr_version = NETMAP_API;
-	nmr.nr_ringid = q;
-
-	if (w)
-		nmr.nr_flags |= NR_REG_ONE_NIC;
-	else
-		nmr.nr_flags |= NR_REG_ALL_NIC;
-
-	if (ioctl (fd, NIOCREGIF, &nmr) < 0) {
-		D ("unable to register interface %s", ifname);
-		return -1;
-	}
-
-	if (vale_rings && strncmp (ifname, "vale", 4) == 0) {
-		nmr.nr_rx_rings = vale_rings;
-		nmr.nr_tx_rings = vale_rings;
-	}
-
-	mem = mmap (NULL, nmr.nr_memsize,
-		    PROT_READ|PROT_WRITE, MAP_SHARED, fd, 0);
-	if (mem == MAP_FAILED) {
-		D ("unable to mmap");
-		return -1;
-	}
-
-	nifp = NETMAP_IF (mem, nmr.nr_offset);
-
-	if (x > 0)
-		*ring = NETMAP_TXRING (nifp, q);
-	else
-		*ring = NETMAP_RXRING (nifp, q);
-
-	return fd;
-}
-#define nm_hw_tx_ring(i, q, r) nm_ring (i, q, r, 1, NETMAP_HW_RING)
-#define nm_hw_rx_ring(i, q, r) nm_ring (i, q, r, 0, NETMAP_HW_RING)
-#define nm_sw_tx_ring(i, q, r) nm_ring (i, q, r, 1, NETMAP_SW_RING)
-#define nm_sw_rx_ring(i, q, r) nm_ring (i, q, r, 0, NETMAP_SW_RING)
-#define nm_vl_tx_ring(i, q, r) nm_ring (i, q, r, 1, 0)
-#define nm_vl_rx_ring(i, q, r) nm_ring (i, q, r, 0, 0)
 
 
 void
@@ -413,7 +348,9 @@ usage (void)
 int
 main (int argc, char ** argv)
 {
-	int n, q, ch, f_flag = 0;
+	int n, ch, f_flag = 0;
+
+	struct nm_desc * nm;
 
 	repgen.intf = NULL;
 	repgen.qname = NULL;
@@ -447,28 +384,32 @@ main (int argc, char ** argv)
 		return -1;
 	}
 
-	q = nm_get_rx_ring_num (repgen.intf);
-
-	if (f_flag) {
-		daemon (0, 0);
+	nm = nm_open (repgen.intf, NULL, 0, NULL);
+	if (!nm) {
+		D ("failed to open %s", repgen.intf);
+		return -1;
 	}
 
 	/* Assign threads for each RX rings of Right interface */
-	for (n = 0; n < q; n++) {
+	for (n = nm->first_tx_ring; n < nm->last_tx_ring; n++) {
 		struct vnfapp * va;
 		va = (struct vnfapp *) malloc (sizeof (struct vnfapp));
 		memset (va, 0, sizeof (struct vnfapp));
 
 		va->rx_q = n;
-		va->tx_q = n % q;
+		va->tx_q = n;
 		va->rx_if = repgen.intf;
 		va->tx_if = repgen.intf;
-		va->rx_fd = nm_vl_rx_ring(repgen.intf, va->rx_q, &va->rx_ring);
-		va->tx_fd = nm_vl_tx_ring(repgen.intf, va->tx_q, &va->tx_ring);
-
+		va->rx_fd = nm->fd;
+		va->tx_fd = nm->fd;
+		va->tx_ring = NETMAP_TXRING (nm->nifp, va->tx_q);
 		pthread_create (&va->tid, NULL, processing_thread, va);
 	}
 	
+
+	if (f_flag) {
+		daemon (0, 0);
+	}
 
 	while (1) {
 		/* controlling module will be implemented here */
