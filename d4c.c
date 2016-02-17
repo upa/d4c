@@ -71,6 +71,8 @@ struct d4c {
 	int accept_sock;	/* fd after accept */
 	int monitor_sock;	/* tcp socket for packet counter */
 	int monitor_port;	/* port number for tcp socket */
+
+	FILE * logfd;		/* fd for logging dropped packet */
 };
 
 struct d4c d4c;
@@ -361,6 +363,11 @@ split_prefixlen (char * str, void * prefix, int * len)
 u_int
 move (struct vnfapp * va, struct netmap_ring * rx_ring, struct netmap_ring * tx_ring)
 {
+	int n;
+	char logbuf[256], addrbuf1[16], addrbuf2[16];
+	time_t timer;
+	struct tm * tm;
+
 	u_int burst, m, j, k;
 	
 	u_int16_t ether_type;
@@ -371,6 +378,7 @@ move (struct vnfapp * va, struct netmap_ring * rx_ring, struct netmap_ring * tx_
 	struct dns_hdr * dns;
 	struct dns_match * match;
 	struct netmap_slot * rs, * ts;
+
 
 #ifdef	ZEROCOPY
 	u_int idx;
@@ -460,6 +468,33 @@ move (struct vnfapp * va, struct netmap_ring * rx_ring, struct netmap_ring * tx_
 			va->dropped_query_byte += rs->len;
 			match->dropped_pkt++;
 			match->dropped_byte += rs->len;
+
+			if (d4c.logfd) {
+				/* logging dropped packet */
+
+				time (&timer);
+				tm = localtime (&timer);
+
+				inet_ntop (AF_INET, &ip->ip_src, addrbuf1,
+					   sizeof (addrbuf1));
+				inet_ntop (AF_INET, &ip->ip_dst, addrbuf2,
+					   sizeof (addrbuf2));
+				snprintf (logbuf, sizeof (logbuf),
+					  "%d/%d/%d:%d:%d:%d %s->%s %s\n",
+					  tm->tm_year + 1900,
+					  tm->tm_mon + 1,
+					  tm->tm_mday,
+					  tm->tm_hour,
+					  tm->tm_min,
+					  tm->tm_sec,
+					  addrbuf1, addrbuf2,
+					  match->query);
+				n = fputs (logbuf, d4c.logfd);
+				if (n < 1) {
+					D ("log write failed\n");
+				}
+			}
+
 			goto packet_drop;
 		}
 
@@ -521,6 +556,9 @@ processing_thread (void * param)
 			ioctl (va->rx_fd, NIOCRXSYNC, va->rx_q);
 			move2 (va);
 			ioctl (va->tx_fd, NIOCTXSYNC, va->tx_q);
+
+			if (d4c.logfd)
+				fflush (d4c.logfd);
 		}
 	}
 
@@ -687,6 +725,7 @@ usage (void)
 		"\t" "-v : Verbose mode\n"
 		"\t" "-h : Print this help\n"
 		"\t" "-o : single thread mode\n"
+		"\t" "-x [filename] : logging dropped packet\n"
 		"");
 		
 
@@ -713,7 +752,7 @@ main (int argc, char ** argv)
 	d4c.vnfapps_num = 0;
 	d4c.monitor_port = MONITOR_PORT;
 
-	while ((ch = getopt (argc, argv, "r:l:q:e:d:s:m:p:cfvho")) != -1) {
+	while ((ch = getopt (argc, argv, "r:l:q:e:d:s:m:p:x:cfvho")) != -1) {
 		switch (ch) {
 		case 'r' :
 			rif = optarg;
@@ -769,6 +808,13 @@ main (int argc, char ** argv)
 			d4c.monitor_port = atoi (optarg);
 			D ("port number for packet counter is %d",
 			   d4c.monitor_port);
+			break;
+		case 'x' :
+			d4c.logfd = fopen (optarg, "a");
+			if (d4c.logfd == NULL) {
+				D ("failed to open %s", optarg);
+				return -1;
+			}
 			break;
 		case 'c' :
 			c_flag = 1;
